@@ -29,6 +29,8 @@ class TaskCreate(BaseModel):
     importance: int = Field(ge=1, le=10)
     due_at:datetime | None = None
     parent_task_id: UUID | None = None
+    depends_on_task_id: UUID | None = None
+    
 
 class Task(TaskCreate):
     id: UUID
@@ -84,6 +86,12 @@ def get_tasks(status: TaskStatus | None = None):
     "deadline_risk": calculate_deadline_risk(task),
     "priority_score": calculate_priority(task),
     "parent_task_id": task.parent_task_id,
+    "blocked": is_task_blocked(task),
+    "blocked_by": (
+        get_blocking_task(task).title
+        if get_blocking_task(task)
+        else None
+    ),
         }
         for task in sorted_tasks
     ]
@@ -102,6 +110,7 @@ def get_next_task():
     unfinished_tasks = [
         task for task in tasks
         if task.status != TaskStatus.DONE
+        and not is_task_blocked(task)
     ]
 
     if not unfinished_tasks:
@@ -126,6 +135,19 @@ def get_current_task():
 
     return {"message": "No task currently in progress"}
 
+@app.get("/tasks/{task_id}/progress")
+def get_task_progress(task_id: UUID):
+    progress = calculate_task_progress(task_id)
+
+    if progress is None:
+        return {
+            "total": 0,
+            "completed": 0,
+            "percentage": 0
+        }
+
+    return progress
+
 @app.post("/tasks")
 def create_task(task: TaskCreate):
     new_task = Task(
@@ -141,30 +163,48 @@ def complete_task(task_id: UUID):
         if task.id == task_id:
             task.status = TaskStatus.DONE
             task.completed_at = datetime.now()
+
+            update_parent_status(task)
+
             return task
 
     raise HTTPException(
-    status_code=404,
-    detail="Task not found"
-)
+        status_code=404,
+        detail="Task not found"
+    )
 
 @app.patch("/tasks/{task_id}/start")
 def start_task(task_id: UUID):
+
+    # First: make sure another task is not already active
     for task in tasks:
-        if task.id == task_id:
-            task.status = TaskStatus.IN_PROGRESS
-            task.started_at = datetime.now()
-            return task
         if task.status == TaskStatus.IN_PROGRESS and task.id != task_id:
             raise HTTPException(
                 status_code=409,
                 detail=f"{task.title} is already in progress"
             )
 
+    # Second: find the task the user is trying to start
+    for task in tasks:
+        if task.id == task_id:
+
+            # Make sure its dependency is finished
+            if is_task_blocked(task):
+                raise HTTPException(
+                    status_code=409,
+                    detail="Task dependency is not completed"
+                )
+
+            task.status = TaskStatus.IN_PROGRESS
+            task.started_at = datetime.now()
+
+            return task
+
+    # If we never found the task ID
     raise HTTPException(
-    status_code=404,
-    detail="Task not found"
-)
+        status_code=404,
+        detail="Task not found"
+    )
 
 def calculate_priority(task: Task):
     score = task.importance * 10
@@ -279,3 +319,71 @@ def calculate_deadline_risk(task: Task):
         return "medium"
 
     return "low"
+
+def calculate_task_progress(task_id: UUID):
+    subtasks = [
+        task for task in tasks
+        if task.parent_task_id == task_id
+    ]
+
+    if not subtasks:
+        return None
+
+    completed = [
+        task for task in subtasks
+        if task.status == TaskStatus.DONE
+    ]
+
+    return {
+        "total": len(subtasks),
+        "completed": len(completed),
+        "percentage": round(
+            len(completed) / len(subtasks) * 100
+        )
+    }
+
+def is_task_blocked(task: Task):
+    if task.depends_on_task_id is None:
+        return False
+
+    for other_task in tasks:
+        if other_task.id == task.depends_on_task_id:
+            return other_task.status != TaskStatus.DONE
+
+    return True
+
+def get_blocking_task(task: Task):
+    if task.depends_on_task_id is None:
+        return None
+
+    for other_task in tasks:
+        if other_task.id == task.depends_on_task_id:
+            return other_task
+
+    return None
+
+def update_parent_status(task: Task):
+    if task.parent_task_id is None:
+        return
+
+    parent = None
+
+    for other_task in tasks:
+        if other_task.id == task.parent_task_id:
+            parent = other_task
+            break
+
+    if parent is None:
+        return
+
+    subtasks = [
+        other_task for other_task in tasks
+        if other_task.parent_task_id == parent.id
+    ]
+
+    if subtasks and all(
+        subtask.status == TaskStatus.DONE
+        for subtask in subtasks
+    ):
+        parent.status = TaskStatus.DONE
+        parent.completed_at = datetime.now()
