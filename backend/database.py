@@ -27,3 +27,11 @@ if __name__ == "__main__":
     except Exception as error:
         print("Database connection failed")
         print(error)
+
+def get_db():
+    db = SessionLocal()
+
+    try:
+        yield db
+    finally:
+        db.close()

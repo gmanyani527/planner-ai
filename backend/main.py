@@ -1,11 +1,14 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException, Depends
 from pydantic import BaseModel, Field
 from enum import Enum
 from datetime import datetime
 from uuid import UUID, uuid4
-from fastapi import FastAPI, HTTPException
+from sqlalchemy.orm import Session
 
+import models
+from database import engine, get_db
 
+models.Base.metadata.create_all(bind=engine)
 app = FastAPI()
 
 class TaskCategory(str, Enum):
@@ -55,17 +58,20 @@ def get_category_analytics(category: TaskCategory):
 
 
 @app.get("/tasks")
-def get_tasks(status: TaskStatus | None = None):
-    filtered_tasks = tasks
+def get_tasks(
+    status: TaskStatus | None = None,
+    db: Session = Depends(get_db)
+    ):
+    query = db.query(models.TaskDB)
 
     if status:
-        filtered_tasks = [
-            task for task in tasks
-            if task.status == status
-        ]
+            query = query.filter(
+            models.TaskDB.status == status.value
+            )
+    tasks_from_db = query.all()
 
     sorted_tasks = sorted(
-        filtered_tasks,
+        tasks_from_db,
         key=calculate_priority,
         reverse=True
     )
@@ -127,13 +133,21 @@ def get_next_task():
         "status": next_task.status,
         "priority_score": calculate_priority(next_task)
     }
-@app.get("/tasks/current")
-def get_current_task():
-    for task in tasks:
-        if task.status == TaskStatus.IN_PROGRESS:
-            return task
 
-    return {"message": "No task currently in progress"}
+@app.get("/tasks/current")
+def get_current_task(
+    db: Session = Depends(get_db)
+):
+    current_task = (
+        db.query(models.TaskDB)
+        .filter(models.TaskDB.status == TaskStatus.IN_PROGRESS.value)
+        .first()
+    )
+
+    if current_task is None:
+        return {"message": "No task currently in progress"}
+
+    return current_task
 
 @app.get("/tasks/{task_id}/progress")
 def get_task_progress(task_id: UUID):
@@ -149,12 +163,22 @@ def get_task_progress(task_id: UUID):
     return progress
 
 @app.post("/tasks")
-def create_task(task: TaskCreate):
-    new_task = Task(
-        **task.model_dump(),
-        id=uuid4()
+def create_task(
+    task: TaskCreate,
+    db: Session = Depends(get_db)
+):
+    new_task = models.TaskDB(
+        title=task.title,
+        category=task.category.value,
+        estimated_minutes=task.estimated_minutes,
+        importance=task.importance,
+        due_at=task.due_at
     )
-    tasks.append(new_task)
+
+    db.add(new_task)
+    db.commit()
+    db.refresh(new_task)
+
     return new_task
 
 @app.patch("/tasks/{task_id}/done")
@@ -174,51 +198,52 @@ def complete_task(task_id: UUID):
     )
 
 @app.patch("/tasks/{task_id}/start")
-def start_task(task_id: UUID):
-
-    # First: make sure another task is not already active
-    for task in tasks:
-        if task.status == TaskStatus.IN_PROGRESS and task.id != task_id:
-            raise HTTPException(
-                status_code=409,
-                detail=f"{task.title} is already in progress"
-            )
-
-    # Second: find the task the user is trying to start
-    for task in tasks:
-        if task.id == task_id:
-
-            # Make sure its dependency is finished
-            if is_task_blocked(task):
-                raise HTTPException(
-                    status_code=409,
-                    detail="Task dependency is not completed"
-                )
-
-            task.status = TaskStatus.IN_PROGRESS
-            task.started_at = datetime.now()
-
-            return task
-
-    # If we never found the task ID
-    raise HTTPException(
-        status_code=404,
-        detail="Task not found"
+def start_task(
+    task_id: UUID,
+    db: Session = Depends(get_db)
+):
+    current_task = (
+        db.query(models.TaskDB)
+        .filter(models.TaskDB.status == TaskStatus.IN_PROGRESS.value)
+        .first()
     )
+
+    if current_task and current_task.id != task_id:
+        raise HTTPException(
+            status_code=409,
+            detail=f"{current_task.title} is already in progress"
+        )
+
+    task = (
+        db.query(models.TaskDB)
+        .filter(models.TaskDB.id == task_id)
+        .first()
+    )
+
+    if task is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Task not found"
+        )
+
+    task.status = TaskStatus.IN_PROGRESS.value
+    task.started_at = datetime.now()
+
+    db.commit()
+    db.refresh(task)
+
+    return task
 
 def calculate_priority(task: Task):
     score = task.importance * 10
+
+    risk = calculate_deadline_risk(task)
 
     if risk == "overdue":
         score += 50
     elif risk == "high":
         score += 30
     elif risk == "medium":
-        score += 15
-
-    if task.category == TaskCategory.EXAM:
-        score += 20 
-    elif task.category == TaskCategory.SCHOOL:
         score += 15
     elif task.category == TaskCategory.INTERNSHIP:
         score += 10
