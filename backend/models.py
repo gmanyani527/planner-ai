@@ -1,4 +1,4 @@
-from sqlalchemy import Column, String, Integer, DateTime
+from sqlalchemy import Column, String, Integer, DateTime, ForeignKey
 from sqlalchemy.dialects.postgresql import UUID
 from uuid import uuid4
 
@@ -54,3 +54,15 @@ class TaskDB(Base):
         DateTime(timezone=True),
         nullable=True
     )
+
+    parent_task_id = Column(
+    UUID(as_uuid=True),
+    ForeignKey("tasks.id"),
+    nullable=True
+    )
+    depends_on_task_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("tasks.id"),
+        nullable=True
+    )
+    

@@ -41,15 +41,20 @@ class Task(TaskCreate):
     started_at: datetime | None = None
     completed_at: datetime | None = None
 
-tasks = [] 
 @app.get("/")
 
 def home():
     return {"message" : "Planner AI is running"}
 
 @app.get("/analytics/category/{category}")
-def get_category_analytics(category: TaskCategory):
-    multiplier = calculate_category_multiplier(category)
+def get_category_analytics(
+    category: TaskCategory,
+    db: Session = Depends(get_db)
+):
+    multiplier = calculate_category_multiplier(
+        category,
+        db
+    )
 
     return {
         "category": category,
@@ -72,7 +77,7 @@ def get_tasks(
 
     sorted_tasks = sorted(
         tasks_from_db,
-        key=calculate_priority,
+        key=lambda task: calculate_priority(task, db),
         reverse=True
     )
 
@@ -85,17 +90,17 @@ def get_tasks(
     "due_at": task.due_at,
     "status": task.status,
     "estimated_minutes": task.estimated_minutes,
-    "recommended_minutes": calculate_recommended_minutes(task),
+    "recommended_minutes": calculate_recommended_minutes(task,db),
     "actual_minutes": calculate_actual_minutes(task),
     "estimate_difference": calculate_estimate_difference(task),
     "estimate_ratio": calculate_estimate_ratio(task),
-    "deadline_risk": calculate_deadline_risk(task),
-    "priority_score": calculate_priority(task),
+    "deadline_risk": calculate_deadline_risk(task,db),
+    "priority_score": calculate_priority(task, db),
     "parent_task_id": task.parent_task_id,
-    "blocked": is_task_blocked(task),
+    "blocked": is_task_blocked(task, db),
     "blocked_by": (
-        get_blocking_task(task).title
-        if get_blocking_task(task)
+        get_blocking_task(task, db).title
+        if get_blocking_task(task, db)
         else None
     ),
         }
@@ -103,35 +108,46 @@ def get_tasks(
     ]
 
 @app.get("/tasks/{task_id}/subtasks")
-def get_subtasks(task_id: UUID):
-    subtasks = [
-        task for task in tasks
-        if task.parent_task_id == task_id
-    ]
+def get_subtasks(
+    task_id: UUID,
+    db: Session = Depends(get_db)
+):
+    subtasks = (
+        db.query(models.TaskDB)
+        .filter(models.TaskDB.parent_task_id == task_id)
+        .all()
+    )
 
     return subtasks
 
 @app.get("/tasks/next")
-def get_next_task():
-    unfinished_tasks = [
-        task for task in tasks
-        if task.status != TaskStatus.DONE
-        and not is_task_blocked(task)
+def get_next_task(
+    db: Session = Depends(get_db)
+):
+    unfinished_tasks = (
+        db.query(models.TaskDB)
+        .filter(models.TaskDB.status != TaskStatus.DONE.value)
+        .all()
+    )
+
+    available_tasks = [
+        task for task in unfinished_tasks
+        if not is_task_blocked(task, db)
     ]
 
-    if not unfinished_tasks:
-        return {"message": "No unfinished tasks"}
+    if not available_tasks:
+        return {"message": "No available tasks"}
 
     next_task = max(
-        unfinished_tasks,
-        key=calculate_priority
+        available_tasks,
+        key=lambda task: calculate_priority(task, db)
     )
 
     return {
         "id": next_task.id,
         "title": next_task.title,
         "status": next_task.status,
-        "priority_score": calculate_priority(next_task)
+        "priority_score": calculate_priority(next_task, db)
     }
 
 @app.get("/tasks/current")
@@ -150,8 +166,11 @@ def get_current_task(
     return current_task
 
 @app.get("/tasks/{task_id}/progress")
-def get_task_progress(task_id: UUID):
-    progress = calculate_task_progress(task_id)
+def get_task_progress(
+    task_id: UUID,
+    db: Session = Depends(get_db)
+):
+    progress = calculate_task_progress(task_id, db)
 
     if progress is None:
         return {
@@ -172,7 +191,9 @@ def create_task(
         category=task.category.value,
         estimated_minutes=task.estimated_minutes,
         importance=task.importance,
-        due_at=task.due_at
+        due_at=task.due_at,
+        parent_task_id=task.parent_task_id,
+        depends_on_task_id=task.depends_on_task_id
     )
 
     db.add(new_task)
@@ -182,20 +203,37 @@ def create_task(
     return new_task
 
 @app.patch("/tasks/{task_id}/done")
-def complete_task(task_id: UUID):
-    for task in tasks:
-        if task.id == task_id:
-            task.status = TaskStatus.DONE
-            task.completed_at = datetime.now()
+def complete_task(
+    task_id: UUID,
+    db: Session = Depends(get_db)
+):
+    task = (
+    db.query(models.TaskDB)
+    .filter(models.TaskDB.id == task_id)
+    .first()
+)
 
-            update_parent_status(task)
-
-            return task
-
-    raise HTTPException(
+    if task is None:
+        raise HTTPException(
         status_code=404,
         detail="Task not found"
     )
+
+    if is_task_blocked(task, db):
+        raise HTTPException(
+        status_code=409,
+        detail="Task dependency is not completed"
+    )
+
+    task.status = TaskStatus.DONE.value
+    task.completed_at = datetime.now()
+
+    db.commit()
+    db.refresh(task)
+
+    update_parent_status(task, db)
+
+    return task
 
 @app.patch("/tasks/{task_id}/start")
 def start_task(
@@ -220,10 +258,17 @@ def start_task(
         .first()
     )
 
+
     if task is None:
         raise HTTPException(
             status_code=404,
             detail="Task not found"
+        )
+    
+    if is_task_blocked(task, db):
+            raise HTTPException(
+            status_code=409,
+            detail="Task dependency is not completed"
         )
 
     task.status = TaskStatus.IN_PROGRESS.value
@@ -234,10 +279,13 @@ def start_task(
 
     return task
 
-def calculate_priority(task: Task):
+def calculate_priority(
+    task,
+    db: Session
+):
     score = task.importance * 10
 
-    risk = calculate_deadline_risk(task)
+    risk = calculate_deadline_risk(task, db)
 
     if risk == "overdue":
         score += 50
@@ -245,13 +293,19 @@ def calculate_priority(task: Task):
         score += 30
     elif risk == "medium":
         score += 15
-    elif task.category == TaskCategory.INTERNSHIP:
+
+    if task.category == TaskCategory.EXAM.value:
+        score += 20
+    elif task.category == TaskCategory.SCHOOL.value:
+        score += 15
+    elif task.category == TaskCategory.INTERNSHIP.value:
         score += 10
-    elif task.category == TaskCategory.DSA:
+    elif task.category == TaskCategory.DSA.value:
         score += 5
 
     if task.due_at:
         now = datetime.now(task.due_at.tzinfo)
+
         hours_until_due = (
             task.due_at - now
         ).total_seconds() / 3600
@@ -261,7 +315,8 @@ def calculate_priority(task: Task):
         elif hours_until_due <= 72:
             score += 20
         elif hours_until_due <= 168:
-            score += 10 
+            score += 10
+
     return score
 
 def calculate_actual_minutes(task: Task):
@@ -295,15 +350,26 @@ def calculate_estimate_ratio(task: Task):
         2
     )
 
-def calculate_category_multiplier(category: TaskCategory):
+def calculate_category_multiplier(
+    category: TaskCategory,
+    db: Session
+):
+    completed_tasks = (
+        db.query(models.TaskDB)
+        .filter(
+            models.TaskDB.category == category.value,
+            models.TaskDB.status == TaskStatus.DONE.value
+        )
+        .all()
+    )
+
     ratios = []
 
-    for task in tasks:
-        if task.category == category and task.status == TaskStatus.DONE:
-            ratio = calculate_estimate_ratio(task)
+    for task in completed_tasks:
+        ratio = calculate_estimate_ratio(task)
 
-            if ratio is not None:
-                ratios.append(ratio)
+        if ratio is not None:
+            ratios.append(ratio)
 
     if not ratios:
         return 1.0
@@ -313,14 +379,23 @@ def calculate_category_multiplier(category: TaskCategory):
         2
     )
 
-def calculate_recommended_minutes(task: Task):
-    multiplier = calculate_category_multiplier(task.category)
+def calculate_recommended_minutes(
+    task,
+    db: Session
+):
+    multiplier = calculate_category_multiplier(
+        TaskCategory(task.category),
+        db
+    )
 
     return round(
         task.estimated_minutes * multiplier
     )
 
-def calculate_deadline_risk(task: Task):
+def calculate_deadline_risk(
+    task,
+    db: Session
+):
     if task.due_at is None:
         return "none"
 
@@ -330,7 +405,10 @@ def calculate_deadline_risk(task: Task):
         task.due_at - now
     ).total_seconds() / 3600
 
-    recommended_minutes = calculate_recommended_minutes(task)
+    recommended_minutes = calculate_recommended_minutes(
+        task,
+        db
+    )
 
     if hours_until_due <= 0:
         return "overdue"
@@ -345,18 +423,22 @@ def calculate_deadline_risk(task: Task):
 
     return "low"
 
-def calculate_task_progress(task_id: UUID):
-    subtasks = [
-        task for task in tasks
-        if task.parent_task_id == task_id
-    ]
+def calculate_task_progress(
+    task_id: UUID,
+    db: Session
+):
+    subtasks = (
+        db.query(models.TaskDB)
+        .filter(models.TaskDB.parent_task_id == task_id)
+        .all()
+    )
 
     if not subtasks:
         return None
 
     completed = [
         task for task in subtasks
-        if task.status == TaskStatus.DONE
+        if task.status == TaskStatus.DONE.value
     ]
 
     return {
@@ -367,48 +449,56 @@ def calculate_task_progress(task_id: UUID):
         )
     }
 
-def is_task_blocked(task: Task):
+def is_task_blocked(task, db: Session):
     if task.depends_on_task_id is None:
         return False
 
-    for other_task in tasks:
-        if other_task.id == task.depends_on_task_id:
-            return other_task.status != TaskStatus.DONE
+    blocking_task = (
+        db.query(models.TaskDB)
+        .filter(models.TaskDB.id == task.depends_on_task_id)
+        .first()
+    )
 
-    return True
+    if blocking_task is None:
+        return True
 
-def get_blocking_task(task: Task):
+    return blocking_task.status != TaskStatus.DONE.value
+
+def get_blocking_task(task, db: Session):
     if task.depends_on_task_id is None:
         return None
 
-    for other_task in tasks:
-        if other_task.id == task.depends_on_task_id:
-            return other_task
+    return (
+        db.query(models.TaskDB)
+        .filter(models.TaskDB.id == task.depends_on_task_id)
+        .first()
+    )
 
-    return None
-
-def update_parent_status(task: Task):
+def update_parent_status(task, db: Session):
     if task.parent_task_id is None:
         return
 
-    parent = None
-
-    for other_task in tasks:
-        if other_task.id == task.parent_task_id:
-            parent = other_task
-            break
+    parent = (
+        db.query(models.TaskDB)
+        .filter(models.TaskDB.id == task.parent_task_id)
+        .first()
+    )
 
     if parent is None:
         return
 
-    subtasks = [
-        other_task for other_task in tasks
-        if other_task.parent_task_id == parent.id
-    ]
+    subtasks = (
+        db.query(models.TaskDB)
+        .filter(models.TaskDB.parent_task_id == parent.id)
+        .all()
+    )
 
     if subtasks and all(
-        subtask.status == TaskStatus.DONE
+        subtask.status == TaskStatus.DONE.value
         for subtask in subtasks
     ):
-        parent.status = TaskStatus.DONE
+        parent.status = TaskStatus.DONE.value
         parent.completed_at = datetime.now()
+
+        db.commit()
+        db.refresh(parent)
